@@ -3,14 +3,16 @@
 GEM_NAME=$1
 PACKAGE_NAME=rubygem-$GEM_NAME
 TEMPLATE_NAME=$2
-TEMPLATE=gem2rpm/$TEMPLATE_NAME.spec.erb
+TEMPLATE=$(pwd)/gem2rpm/$TEMPLATE_NAME.spec.erb
 TITO_TAG=$3
 DISTRO=${TITO_TAG##*-}
 PACKAGE_SUBDIR=$4
 
 if [[ -z $PACKAGE_DIR ]] ; then
-	if [[ $TEMPLATE_NAME == *_plugin ]] ; then
+	if [[ $TITO_TAG == foreman-plugins-* ]] ; then
 		PACKAGE_SUBDIR="plugins"
+	elif [[ $TITO_TAG == katello-* ]] ; then
+		PACKAGE_SUBDIR="katello"
 	else
 		PACKAGE_SUBDIR="foreman"
 	fi
@@ -28,7 +30,7 @@ usage() {
 generate_gem_package() {
 	mkdir $PACKAGE_DIR
 	pushd $PACKAGE_DIR
-	gem2rpm -o $PACKAGE_NAME.spec --fetch $GEM_NAME -t ../$TEMPLATE
+	gem2rpm -o $PACKAGE_NAME.spec --fetch $GEM_NAME -t $TEMPLATE
 	git annex add *.gem
 	git add $PACKAGE_NAME.spec
 	popd
@@ -54,8 +56,8 @@ add_gem_to_comps() {
 		local comps_package="tfm-${PACKAGE_NAME}"
 	fi
 
-	# TODO: scl or non-scl could still only be needed for plugins
-	if [[ $TEMPLATE_NAME == *_plugin ]] ; then
+	# TODO: figure this out for katello
+	if [[ $TITO_TAG == foreman-plugins-* ]]; then
 		local comps_file="foreman-plugins"
 	else
 		local comps_file="foreman"
