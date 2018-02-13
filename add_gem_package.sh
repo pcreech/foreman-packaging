@@ -6,17 +6,28 @@ TEMPLATE_NAME=$2
 TEMPLATE=gem2rpm/$TEMPLATE_NAME.spec.erb
 TITO_TAG=$3
 DISTRO=${TITO_TAG##*-}
+PACKAGE_SUBDIR=$4
+
+if [[ -z $PACKAGE_DIR ]] ; then
+	if [[ $TEMPLATE_NAME == *_plugin ]] ; then
+		PACKAGE_SUBDIR="plugins"
+	else
+		PACKAGE_SUBDIR="foreman"
+	fi
+fi
+
+PACKAGE_DIR=packages/$PACKAGE_SUBDIR/$PACKAGE_NAME
 
 usage() {
-	echo "Usage: $0 GEM_NAME TEMPLATE TITO_TAG"
+	echo "Usage: $0 GEM_NAME TEMPLATE TITO_TAG [PACKAGE_SUBDIR]"
 	echo "Valid templates: $(ls gem2rpm | sed 's/.spec.erb//' | tr '\n' ' ')"
 	python -c "import ConfigParser ; c = ConfigParser.ConfigParser() ; c.read('rel-eng/tito.props') ; print 'Tito tags: ' + ' '.join(s for s in c.sections() if s not in ('requirements', 'buildconfig', 'builder'))"
 	exit 1
 }
 
 generate_gem_package() {
-	mkdir $PACKAGE_NAME
-	pushd $PACKAGE_NAME
+	mkdir $PACKAGE_DIR
+	pushd $PACKAGE_DIR
 	gem2rpm -o $PACKAGE_NAME.spec --fetch $GEM_NAME -t ../$TEMPLATE
 	git annex add *.gem
 	git add $PACKAGE_NAME.spec
@@ -44,7 +55,7 @@ add_gem_to_comps() {
 	fi
 
 	# TODO: scl or non-scl could still only be needed for plugins
-	if [[ $TEMPLATE_NAME == "*_plugin" ]] ; then
+	if [[ $TEMPLATE_NAME == *_plugin ]] ; then
 		local comps_file="foreman-plugins"
 	else
 		local comps_file="foreman"
