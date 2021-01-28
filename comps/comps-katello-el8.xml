@@ -66,6 +66,8 @@
       <packagereq type="default">rubygem-zest</packagereq>
       <!-- other katello related packages -->
       <packagereq type="default">rhel8-kickstart-setup</packagereq>
+      <packagereq type="default">jsoncpp</packagereq>
+      <packagereq type="default">qpid-proton-cpp</packagereq>
     </packagelist>
   </group>
   <group>

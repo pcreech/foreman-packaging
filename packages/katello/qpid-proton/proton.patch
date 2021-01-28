@@ -1,0 +1,638 @@
+From dd8a5dc47f513a6596c221149aa60accdfcdb434 Mon Sep 17 00:00:00 2001
+From: Kim van der Riet <kvdr@localhost.localdomain>
+Date: Tue, 10 Dec 2019 10:56:30 -0500
+Subject: [PATCH 1/6] Changed Sphinx invocation from sphinx to sphinx-build for
+ RHEL7
+
+---
+ python/CMakeLists.txt | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/python/CMakeLists.txt b/python/CMakeLists.txt
+index bdd2b4c..0991da1 100644
+--- a/python/CMakeLists.txt
++++ b/python/CMakeLists.txt
+@@ -127,7 +127,7 @@ else ()
+         COMMAND ${PN_ENV_SCRIPT} --
+         PYTHONPATH=${CMAKE_CURRENT_BINARY_DIR}:${CMAKE_CURRENT_SOURCE_DIR}
+         LD_LIBRARY_PATH="${CMAKE_CURRENT_BINARY_DIR}/c"
+-        ${PYTHON_EXECUTABLE} -m sphinx "${CMAKE_CURRENT_SOURCE_DIR}/docs" "${CMAKE_CURRENT_BINARY_DIR}/docs")
++        sphinx-build "${CMAKE_CURRENT_SOURCE_DIR}/docs" "${CMAKE_CURRENT_BINARY_DIR}/docs")
+     add_dependencies(docs docs-py)
+     install(DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/docs/"
+             DESTINATION "${PROTON_SHARE}/docs/api-py"
+-- 
+1.8.3.1
+
+From c3beb0e282c30aafd7eb513f2b4665c12af922d1 Mon Sep 17 00:00:00 2001
+From: Cliff Jansen <cliffjansen@apache.org>
+Date: Mon, 23 Nov 2020 10:27:47 -0800
+Subject: [PATCH 3/6] PROTON-2172: proactor fdlimit test. Should work after
+ PROTON-1496.
+
+---
+ c/tests/fdlimit.py | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/c/tests/fdlimit.py b/c/tests/fdlimit.py
+index 6848c68..2fe2e71 100644
+--- a/c/tests/fdlimit.py
++++ b/c/tests/fdlimit.py
+@@ -51,8 +51,7 @@ class FdLimitTest(unittest.TestCase):
+         if cls.devnull:
+             cls.devnull.close()
+ 
+-    # @unittest.skipUnless(prlimit_available, "prlimit not available")
+-    @unittest.skip("temporarily disabled (epoll fix pending)")
++    @unittest.skipUnless(prlimit_available, "prlimit not available")
+     def test_fd_limit_broker(self):
+         """Check behaviour when running out of file descriptors on accept"""
+         # Not too many FDs but not too few either, some are used for system purposes.
+@@ -64,9 +63,11 @@ class FdLimitTest(unittest.TestCase):
+             # NOTE: broker does not log a file descriptor related error at any point in the test, only
+             #  PN_TRANSPORT_CLOSED: amqp:connection:framing-error: connection aborted
+             #  PN_TRANSPORT_CLOSED: proton:io: Connection reset by peer - disconnected :5672 (connection aborted)
+-            for i in range(fdlimit + 1):
++            for i in range(fdlimit):
+                 receiver = test_subprocess.Popen(["receive", "", b.port, str(i)], stdout=self.devnull)
+                 receivers.append(receiver)
++            # Allow these subprocesses time to establish ahead of the upcoming test sender.
++            time.sleep(1)
+ 
+             # All FDs are now in use, send attempt will (with present implementation) hang
+             with test_subprocess.Popen(["send", "", b.port, "x"],
+-- 
+1.8.3.1
+
+From 385a0e636579d7764ea1bcade3ae5aa1c6247e45 Mon Sep 17 00:00:00 2001
+From: Andrew Stitcher <astitcher@apache.org>
+Date: Fri, 11 Dec 2020 01:43:53 -0500
+Subject: [PATCH 4/6] PROTON-2309: [cpp] Improve reconnect logic and examples -
+ Fix bug in C++ binding that stops it from responding to a forced close from  
+ its peer with a close frame before closing the socket if reconnect is turned
+ on. - Added a reconnect option to the simple_send example - Made reconnect
+ work in simple_connect example
+
+---
+ cpp/examples/simple_connect.cpp     |  6 +-----
+ cpp/examples/simple_send.cpp        | 13 +++++++++----
+ cpp/src/connection.cpp              |  6 +++++-
+ cpp/src/contexts.cpp                |  2 +-
+ cpp/src/contexts.hpp                |  1 +
+ cpp/src/proactor_container_impl.cpp | 39 ++++++++++++++++++++++---------------
+ cpp/src/proactor_container_impl.hpp |  1 -
+ 7 files changed, 40 insertions(+), 28 deletions(-)
+
+diff --git a/cpp/examples/simple_connect.cpp b/cpp/examples/simple_connect.cpp
+index 74a8c87..a9d6d4c 100644
+--- a/cpp/examples/simple_connect.cpp
++++ b/cpp/examples/simple_connect.cpp
+@@ -68,11 +68,7 @@ class simple_connect : public proton::messaging_handler {
+     }
+ 
+     void on_connection_open(proton::connection &c) OVERRIDE {
+-        c.close();
+-    }
+-
+-    void on_error(const proton::error_condition& e) OVERRIDE {
+-        throw std::runtime_error(e.what());
++        if (!reconnect) c.close();
+     }
+ };
+ 
+diff --git a/cpp/examples/simple_send.cpp b/cpp/examples/simple_send.cpp
+index 8e73fa5..21cc67f 100644
+--- a/cpp/examples/simple_send.cpp
++++ b/cpp/examples/simple_send.cpp
+@@ -27,6 +27,7 @@
+ #include <proton/message.hpp>
+ #include <proton/message_id.hpp>
+ #include <proton/messaging_handler.hpp>
++#include <proton/reconnect_options.hpp>
+ #include <proton/tracker.hpp>
+ #include <proton/types.hpp>
+ 
+@@ -40,19 +41,21 @@ class simple_send : public proton::messaging_handler {
+     std::string url;
+     std::string user;
+     std::string password;
++    bool reconnect;
+     proton::sender sender;
+     int sent;
+     int confirmed;
+     int total;
+ 
+   public:
+-    simple_send(const std::string &s, const std::string &u, const std::string &p, int c) :
+-        url(s), user(u), password(p), sent(0), confirmed(0), total(c) {}
++    simple_send(const std::string &s, const std::string &u, const std::string &p, bool r, int c) :
++        url(s), user(u), password(p), reconnect(r), sent(0), confirmed(0), total(c) {}
+ 
+     void on_container_start(proton::container &c) OVERRIDE {
+         proton::connection_options co;
+         if (!user.empty()) co.user(user);
+         if (!password.empty()) co.password(password);
++        if (reconnect) co.reconnect(proton::reconnect_options());
+         sender = c.open_sender(url, co);
+     }
+ 
+@@ -94,18 +97,20 @@ int main(int argc, char **argv) {
+     std::string address("127.0.0.1:5672/examples");
+     std::string user;
+     std::string password;
++    bool reconnect = false;
+     int message_count = 100;
+     example::options opts(argc, argv);
+ 
+     opts.add_value(address, 'a', "address", "connect and send to URL", "URL");
+-    opts.add_value(message_count, 'm', "messages", "send COUNT messages", "COUNT");
+     opts.add_value(user, 'u', "user", "authenticate as USER", "USER");
+     opts.add_value(password, 'p', "password", "authenticate with PASSWORD", "PASSWORD");
++    opts.add_flag(reconnect, 'r', "reconnect", "reconnect on connection failure");
++    opts.add_value(message_count, 'm', "messages", "send COUNT messages", "COUNT");
+ 
+     try {
+         opts.parse();
+ 
+-        simple_send send(address, user, password, message_count);
++        simple_send send(address, user, password, reconnect, message_count);
+         proton::container(send).run();
+ 
+         return 0;
+diff --git a/cpp/src/connection.cpp b/cpp/src/connection.cpp
+index c6686ae..ec3a851 100644
+--- a/cpp/src/connection.cpp
++++ b/cpp/src/connection.cpp
+@@ -60,7 +60,11 @@ void connection::open(const connection_options &opts) {
+     pn_connection_open(pn_object());
+ }
+ 
+-void connection::close() { pn_connection_close(pn_object()); }
++void connection::close() {
++  pn_connection_close(pn_object());
++  reconnect_context* rctx = connection_context::get(pn_object()).reconnect_context_.get();
++  if (rctx) rctx->stop_reconnect_ = true;
++}
+ 
+ std::string connection::virtual_host() const {
+     return str(pn_connection_remote_hostname(pn_object()));
+diff --git a/cpp/src/contexts.cpp b/cpp/src/contexts.cpp
+index 65d883a..f6b7822 100644
+--- a/cpp/src/contexts.cpp
++++ b/cpp/src/contexts.cpp
+@@ -73,7 +73,7 @@ connection_context::connection_context() :
+ {}
+ 
+ reconnect_context::reconnect_context(const reconnect_options_base& ro) :
+-    reconnect_options_(ro), retries_(0), current_url_(-1), reconnected_(false)
++    reconnect_options_(ro), retries_(0), current_url_(-1), stop_reconnect_(false), reconnected_(false)
+ {}
+ 
+ listener_context::listener_context() : listen_handler_(0) {}
+diff --git a/cpp/src/contexts.hpp b/cpp/src/contexts.hpp
+index 6660b55..dcd8081 100644
+--- a/cpp/src/contexts.hpp
++++ b/cpp/src/contexts.hpp
+@@ -112,6 +112,7 @@ class reconnect_context {
+     duration delay_;
+     int retries_;
+     int current_url_;
++    bool stop_reconnect_;
+     bool reconnected_;
+ };
+ 
+diff --git a/cpp/src/proactor_container_impl.cpp b/cpp/src/proactor_container_impl.cpp
+index 0f02891..1fae73b 100644
+--- a/cpp/src/proactor_container_impl.cpp
++++ b/cpp/src/proactor_container_impl.cpp
+@@ -299,11 +299,13 @@ duration next_delay(reconnect_context& rc) {
+     }
+     return random_between(roi.delay, rc.delay_);
+ }
++
++inline reconnect_context* get_reconnect_context(pn_connection_t* pnc) {
++    return connection_context::get(pnc).reconnect_context_.get();
+ }
+ 
+-void container::impl::reset_reconnect(pn_connection_t* pnc) {
+-    connection_context& cc = connection_context::get(pnc);
+-    reconnect_context* rc = cc.reconnect_context_.get();
++void reset_reconnect(pn_connection_t* pnc) {
++    reconnect_context* rc = get_reconnect_context(pnc);
+ 
+     if (!rc) return;
+ 
+@@ -313,10 +315,17 @@ void container::impl::reset_reconnect(pn_connection_t* pnc) {
+     rc->current_url_ = -1;
+ }
+ 
++}
++
+ bool container::impl::can_reconnect(pn_connection_t* pnc) {
++    reconnect_context* rc = get_reconnect_context(pnc);
++
++    // If reconnect not enabled just fail
++    if (!rc) return false;
++
+     // Don't reconnect if we are locally closed, the application will
+     // not expect a connection it closed to re-open.
+-    if (pn_connection_state(pnc) & PN_LOCAL_CLOSED) return false;
++    if (rc->stop_reconnect_) return false;
+ 
+     // If container stopping don't try to reconnect
+     // - we pretend to have set up a reconnect attempt so
+@@ -326,11 +335,6 @@ bool container::impl::can_reconnect(pn_connection_t* pnc) {
+         GUARD(lock_);
+         if (stopping_) return true;
+     }
+-    connection_context& cc = connection_context::get(pnc);
+-    reconnect_context* rc = cc.reconnect_context_.get();
+-
+-    // If reconnect not enabled just fail
+-    if (!rc) return false;
+ 
+     const reconnect_options_base& roi = rc->reconnect_options_;
+ 
+@@ -665,17 +669,19 @@ container::impl::dispatch_result container::impl::dispatch(pn_event_t* event) {
+         pn_connection_t *c = pn_event_connection(event);
+         pn_condition_t *cc = pn_connection_remote_condition(c);
+ 
+-        // amqp:connection:forced should be treated like a transport
+-        // disconnect. Hide the connection error/close events from the
+-        // application and generate a PN_TRANSPORT_CLOSE event.
+-        if (pn_condition_is_set(cc) &&
++        // If reconnect is on, amqp:connection:forced should be treated specially:
++        // Hide the connection error/close events from the application;
++        // Then we close the connection noting the forced close;
++        // Then set up for reconnect handling.
++        if (get_reconnect_context(c) &&
++            pn_condition_is_set(cc) &&
+             !strcmp(pn_condition_get_name(cc), "amqp:connection:forced"))
+         {
+             pn_transport_t* t = pn_event_transport(event);
+             pn_condition_t* tc = pn_transport_condition(t);
+             pn_condition_copy(tc, cc);
+-            pn_transport_close_head(t);
+             pn_transport_close_tail(t);
++            pn_connection_close(c);
+             return ContinueLoop;
+         }
+         break;
+@@ -702,8 +708,9 @@ container::impl::dispatch_result container::impl::dispatch(pn_event_t* event) {
+                         throw;
+                 }
+             }
+-            // on_connection_reconnecting() may have closed the connection, check again.
+-            if (!(pn_connection_state(c) & PN_LOCAL_CLOSED)) {
++            // on_transport_error() may have closed the connection, check again.
++            reconnect_context* rc = get_reconnect_context(c);
++            if (rc && !(rc->stop_reconnect_)) {
+                 setup_reconnect(c);
+                 return ContinueLoop;
+             }
+diff --git a/cpp/src/proactor_container_impl.hpp b/cpp/src/proactor_container_impl.hpp
+index b58ab0e..c8dd1ad 100644
+--- a/cpp/src/proactor_container_impl.hpp
++++ b/cpp/src/proactor_container_impl.hpp
+@@ -107,7 +107,6 @@ class container::impl {
+     void reconnect(pn_connection_t* pnc);
+     bool can_reconnect(pn_connection_t* pnc);
+     void setup_reconnect(pn_connection_t* pnc);
+-    void reset_reconnect(pn_connection_t* pnc);
+ 
+     // Event loop to run in each container thread
+     void thread();
+-- 
+1.8.3.1
+
+From bf0ace73629e934a3f578807a1fc1ed5c8db9bdf Mon Sep 17 00:00:00 2001
+From: Cliff Jansen <cliffjansen@apache.org>
+Date: Fri, 11 Dec 2020 10:29:30 -0800
+Subject: [PATCH 5/6] PROTON-1914: early settlement of inbound streamed
+ message.  This closes #279
+
+---
+ c/src/core/engine-internal.h       |  2 +
+ c/src/core/engine.c                |  2 +
+ c/src/core/transport.c             | 78 ++++++++++++++++++++++++++++----------
+ c/tests/connection_driver_test.cpp | 23 +++++++----
+ 4 files changed, 78 insertions(+), 27 deletions(-)
+
+diff --git a/c/src/core/engine-internal.h b/c/src/core/engine-internal.h
+index 11718c9..832d29d 100644
+--- a/c/src/core/engine-internal.h
++++ b/c/src/core/engine-internal.h
+@@ -305,6 +305,7 @@ struct pn_link_t {
+   pn_sequence_t available;
+   pn_sequence_t credit;
+   pn_sequence_t queued;
++  pn_sequence_t more_id;
+   int drained; // number of drained credits
+   uint8_t snd_settle_mode;
+   uint8_t rcv_settle_mode;
+@@ -313,6 +314,7 @@ struct pn_link_t {
+   bool drain_flag_mode; // receiver only
+   bool drain;
+   bool detached;
++  bool more_pending;
+ };
+ 
+ struct pn_disposition_t {
+diff --git a/c/src/core/engine.c b/c/src/core/engine.c
+index bfc8613..1aa1992 100644
+--- a/c/src/core/engine.c
++++ b/c/src/core/engine.c
+@@ -1177,6 +1177,7 @@ pn_link_t *pn_link_new(int type, pn_session_t *session, const char *name)
+   link->available = 0;
+   link->credit = 0;
+   link->queued = 0;
++  link->more_id = 0;
+   link->drain = false;
+   link->drain_flag_mode = true;
+   link->drained = 0;
+@@ -1186,6 +1187,7 @@ pn_link_t *pn_link_new(int type, pn_session_t *session, const char *name)
+   link->remote_snd_settle_mode = PN_SND_MIXED;
+   link->remote_rcv_settle_mode = PN_RCV_FIRST;
+   link->detached = false;
++  link->more_pending = false;
+   link->properties = 0;
+   link->remote_properties = 0;
+ 
+diff --git a/c/src/core/transport.c b/c/src/core/transport.c
+index fe6ebf1..0467eef 100644
+--- a/c/src/core/transport.c
++++ b/c/src/core/transport.c
+@@ -1519,12 +1519,36 @@ int pn_do_transfer(pn_transport_t *transport, uint8_t frame_type, uint16_t chann
+   if (!link) {
+     return pn_do_error(transport, "amqp:invalid-field", "no such handle: %u", handle);
+   }
+-  pn_delivery_t *delivery;
+-  if (link->unsettled_tail && !link->unsettled_tail->done) {
+-    delivery = link->unsettled_tail;
+-    if (settled_set && !settled && delivery->remote.settled)
+-      return pn_do_error(transport, "amqp:invalid-field", "invalid transition from settled to unsettled");
++  pn_delivery_t *delivery = NULL;
++  bool new_delivery = false;
++  if (link->more_pending) {
++    // Ongoing multiframe delivery.
++    if (link->unsettled_tail && !link->unsettled_tail->done) {
++      delivery = link->unsettled_tail;
++      if (settled_set && !settled && delivery->remote.settled)
++        return pn_do_error(transport, "amqp:invalid-field", "invalid transition from settled to unsettled");
++      if (id_present && id != delivery->state.id)
++        return pn_do_error(transport, "amqp:invalid-field", "invalid delivery-id for a continuation transfer");
++    } else {
++      // Application has already settled.  Delivery is no more.
++      // Ignore content and look for transition to a new delivery.
++      if (!id_present || id == link->more_id) {
++        // Still old delivery.
++        if (!more || aborted)
++          link->more_pending = false;
++      } else {
++        // New id.
++        new_delivery = true;
++        link->more_pending = false;
++      }
++    }
+   } else {
++    new_delivery = true;
++  }
++
++  if (new_delivery) {
++    assert(!link->more_pending);
++    assert(delivery == NULL);
+     pn_delivery_map_t *incoming = &ssn->state.incoming;
+ 
+     if (!ssn->state.incoming_init) {
+@@ -1550,17 +1574,38 @@ int pn_do_transfer(pn_transport_t *transport, uint8_t frame_type, uint16_t chann
+     link->queued++;
+   }
+ 
+-  pn_buffer_append(delivery->bytes, payload->start, payload->size);
+-  ssn->incoming_bytes += payload->size;
+-  delivery->done = !more;
++  if (delivery) {
++    pn_buffer_append(delivery->bytes, payload->start, payload->size);
++    if (more) {
++      if (!link->more_pending) {
++        // First frame of a multi-frame transfer. Remember at link level.
++        link->more_pending = true;
++        assert(id_present);  // Id MUST be set on first frame, and already checked above.
++        link->more_id = id;
++      }
++      delivery->done = false;
++    }
++    else
++      delivery->done = true;
++
++    // XXX: need to fill in remote state: delivery->remote.state = ...;
++    if (settled && !delivery->remote.settled) {
++      delivery->remote.settled = settled;
++      delivery->updated = true;
++      pn_work_update(transport->connection, delivery);
++    }
+ 
+-  // XXX: need to fill in remote state: delivery->remote.state = ...;
+-  if (settled && !delivery->remote.settled) {
+-    delivery->remote.settled = settled;
+-    delivery->updated = true;
+-    pn_work_update(transport->connection, delivery);
++    if ((delivery->aborted = aborted)) {
++      delivery->remote.settled = true;
++      delivery->done = true;
++      delivery->updated = true;
++      link->more_pending = false;
++      pn_work_update(transport->connection, delivery);
++    }
++    pn_collector_put(transport->connection->collector, PN_OBJECT, delivery, PN_DELIVERY);
+   }
+ 
++  ssn->incoming_bytes += payload->size;
+   ssn->state.incoming_transfer_count++;
+   ssn->state.incoming_window--;
+ 
+@@ -1569,13 +1614,6 @@ int pn_do_transfer(pn_transport_t *transport, uint8_t frame_type, uint16_t chann
+     pni_post_flow(transport, ssn, link);
+   }
+ 
+-  if ((delivery->aborted = aborted)) {
+-    delivery->remote.settled = true;
+-    delivery->done = true;
+-    delivery->updated = true;
+-    pn_work_update(transport->connection, delivery);
+-  }
+-  pn_collector_put(transport->connection->collector, PN_OBJECT, delivery, PN_DELIVERY);
+   return 0;
+ }
+ 
+diff --git a/c/tests/connection_driver_test.cpp b/c/tests/connection_driver_test.cpp
+index f8e3345..8a86db5 100644
+--- a/c/tests/connection_driver_test.cpp
++++ b/c/tests/connection_driver_test.cpp
+@@ -1,6 +1,6 @@
+ /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+- h * or more contributor license agreements.  See the NOTICE file
++ * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+@@ -525,10 +525,9 @@ TEST_CASE("driver_duplicate_link_client", "[!hide][!shouldfail]") {
+              cond_empty());
+ }
+ 
+-/* Settling an incomplete delivery should not cause an error
+-   This test will fail till PROTON-1914 is fixed
++/* Settling an incomplete delivery should not cause an error.
+ */
+-TEST_CASE("driver_settle_incomplete_receiver", "[!hide][!shouldfail]") {
++TEST_CASE("driver_settle_incomplete_receiver") {
+   send_client_handler client;
+   delivery_handler server;
+   pn_test::driver_pair d(client, server);
+@@ -544,24 +543,34 @@ TEST_CASE("driver_settle_incomplete_receiver", "[!hide][!shouldfail]") {
+ 
+   /* Send/receive a frame */
+   CHECK(sizeof(data) == pn_link_send(snd, data, sizeof(data)));
++  server.log_clear();
+   d.run();
+   CHECK_THAT(ETYPES(PN_DELIVERY), Equals(server.log_clear()));
+   CHECK(sizeof(data) == pn_link_recv(rcv, rbuf, sizeof(data)));
+   d.run();
+ 
+-  /* Settle the receiver's delivery */
++  /* Settle early while the sender is still sending */
+   pn_delivery_settle(pn_link_current(rcv));
++  CHECK(sizeof(data) == pn_link_send(snd, data, sizeof(data)));
+   d.run();
+   CHECK_THAT(*pn_connection_remote_condition(d.client.connection),
+              cond_empty());
+   CHECK_THAT(*pn_connection_condition(d.server.connection), cond_empty());
+ 
+-  /* Send/receive a frame, should not cause error */
++  pn_delivery_settle(pn_link_current(snd));
++
++  /* Send/receive a new message, should not cause error */
++  pn_link_flow(rcv, 1);
++  d.run();
++  pn_delivery(snd, pn_bytes("2")); /* Prepare to send */
+   CHECK(sizeof(data) == pn_link_send(snd, data, sizeof(data)));
++  server.log_clear();
+   d.run();
+   CHECK_THAT(ETYPES(PN_DELIVERY), Equals(server.log_clear()));
+   CHECK(sizeof(data) == pn_link_recv(rcv, rbuf, sizeof(data)));
+-  d.run();
++  pn_delivery_tag_t tag = pn_delivery_tag(pn_link_current(rcv));
++  CHECK(tag.size == 1);
++  CHECK(tag.start[0] == '2');
+   CHECK_THAT(*pn_connection_remote_condition(d.client.connection),
+              cond_empty());
+   CHECK_THAT(*pn_connection_condition(d.server.connection), cond_empty());
+-- 
+1.8.3.1
+
+From c849fed94716a632d8ba8e3532b9d53d1339d1c0 Mon Sep 17 00:00:00 2001
+From: Cliff Jansen <cliffjansen@apache.org>
+Date: Mon, 14 Dec 2020 09:59:43 -0800
+Subject: [PATCH 6/6] PROTON-1516: add tests for empty last frame in a streamed
+ message
+
+---
+ c/tests/connection_driver_test.cpp  | 42 +++++++++++++++++++++++++++++++++++++
+ python/tests/proton_tests/engine.py | 30 ++++++++++++++++++++++++++
+ 2 files changed, 72 insertions(+)
+
+diff --git a/c/tests/connection_driver_test.cpp b/c/tests/connection_driver_test.cpp
+index 8a86db5..ff04e81 100644
+--- a/c/tests/connection_driver_test.cpp
++++ b/c/tests/connection_driver_test.cpp
+@@ -575,3 +575,45 @@ TEST_CASE("driver_settle_incomplete_receiver") {
+              cond_empty());
+   CHECK_THAT(*pn_connection_condition(d.server.connection), cond_empty());
+ }
++
++/* Empty last frame in streaming message.
++*/
++TEST_CASE("driver_empty_last_frame") {
++  send_client_handler client;
++  delivery_handler server;
++  pn_test::driver_pair d(client, server);
++
++  d.run();
++  pn_link_t *rcv = server.link;
++  pn_link_t *snd = client.link;
++  char data[100] = {0};          /* Dummy data to send. */
++  char rbuf[sizeof(data)] = {0}; /* Read buffer for incoming data. */
++  pn_link_flow(rcv, 1);
++  pn_delivery_t *sd = pn_delivery(snd, pn_bytes("1")); /* Prepare to send */
++  d.run();
++
++  /* Send/receive a frame */
++  CHECK(sizeof(data) == pn_link_send(snd, data, sizeof(data)));
++  server.log_clear();
++  d.run();
++  CHECK_THAT(ETYPES(PN_DELIVERY), Equals(server.log_clear()));
++  CHECK(sizeof(data) == pn_link_recv(rcv, rbuf, sizeof(data)));
++  CHECK(pn_delivery_partial(pn_link_current(rcv)));
++  d.run();
++
++  /* Advance after all data transfered over wire. */
++  CHECK(pn_link_advance(snd));
++  server.log_clear();
++  d.run();
++  CHECK_THAT(ETYPES(PN_DELIVERY), Equals(server.log_clear()));
++  CHECK(PN_EOS == pn_link_recv(rcv, rbuf, sizeof(data)));
++  CHECK(!pn_delivery_partial(pn_link_current(rcv)));
++
++  pn_delivery_settle(sd);
++  sd = NULL;
++  pn_delivery_settle(pn_link_current(rcv));
++  d.run();
++  CHECK_THAT(*pn_connection_remote_condition(d.client.connection),
++             cond_empty());
++  CHECK_THAT(*pn_connection_condition(d.server.connection), cond_empty());
++}
+diff --git a/python/tests/proton_tests/engine.py b/python/tests/proton_tests/engine.py
+index 1b4c02b..70d10c8 100644
+--- a/python/tests/proton_tests/engine.py
++++ b/python/tests/proton_tests/engine.py
+@@ -935,6 +935,36 @@ class TransferTest(Test):
+     self.pump()
+     assert self.rcv.current.aborted
+ 
++  def test_multiframe_last_empty(self):
++    self.rcv.flow(1)
++    sd = self.snd.delivery("tag")
++    msg_p1 = b"this is a test"
++    n = self.snd.send(msg_p1)
++    assert n == len(msg_p1)
++
++    self.pump()
++
++    assert len(msg_p1) == self.rcv.current.pending
++    assert self.rcv.current.partial
++    msg_p2 = b"this is more."
++    n = self.snd.send(msg_p2)
++    assert n == len(msg_p2)
++
++    self.pump()
++
++    msg = msg_p1 + msg_p2
++    assert len(msg) == self.rcv.current.pending
++    assert self.rcv.current.partial
++    # Advance.  Should send empty xfer frame with more flag false.
++    assert self.snd.advance()
++
++    self.pump()
++
++    assert len(msg) == self.rcv.current.pending
++    assert not self.rcv.current.partial
++    binary = self.rcv.recv(self.rcv.current.pending)
++    assert binary == msg
++
+   def test_disposition(self):
+     self.rcv.flow(1)
+ 
+-- 
+1.8.3.1
+
